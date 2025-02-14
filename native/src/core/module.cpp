@@ -15,8 +15,6 @@ using namespace std;
 
 #define VLOGD(tag, from, to) LOGD("%-8s: %s <- %s\n", tag, to, from)
 
-static string native_bridge = "0";
-
 static int bind_mount(const char *reason, const char *from, const char *to) {
     int ret = xmount(from, to, nullptr, MS_BIND | MS_REC, nullptr);
     if (ret == 0)
@@ -29,24 +27,18 @@ static int bind_mount(const char *reason, const char *from, const char *to) {
  *************************/
 
 tmpfs_node::tmpfs_node(node_entry *node) : dir_node(node, this) {
-    if (!skip_mirror()) {
-        string mirror = mirror_path();
-        if (auto dir = open_dir(mirror.data())) {
+    if (!replace()) {
+        if (auto dir = open_dir(node_path().data())) {
             set_exist(true);
             for (dirent *entry; (entry = xreaddir(dir.get()));) {
-                if (entry->d_type == DT_DIR) {
-                    // create a dummy inter_node to upgrade later
-                    emplace<inter_node>(entry->d_name, entry->d_name);
-                } else {
-                    // Insert mirror nodes
-                    emplace<mirror_node>(entry->d_name, entry);
-                }
+                // create a dummy inter_node to upgrade later
+                emplace<inter_node>(entry->d_name, entry);
             }
         }
     }
 
     for (auto it = children.begin(); it != children.end(); ++it) {
-        // Need to upgrade all inter_node children to tmpfs_node
+        // Upgrade resting inter_node children to tmpfs_node
         if (isa<inter_node>(it->second))
             it = upgrade<tmpfs_node>(it);
     }
@@ -54,18 +46,19 @@ tmpfs_node::tmpfs_node(node_entry *node) : dir_node(node, this) {
 
 bool dir_node::prepare() {
     // If direct replace or not exist, mount ourselves as tmpfs
-    bool upgrade_to_tmpfs = skip_mirror() || !exist();
+    bool upgrade_to_tmpfs = replace() || !exist();
 
     for (auto it = children.begin(); it != children.end();) {
         // We also need to upgrade to tmpfs node if any child:
         // - Target does not exist
-        // - Source or target is a symlink (since we cannot bind mount symlink)
+        // - Source or target is a symlink (since we cannot bind mount symlink) or whiteout
         bool cannot_mnt;
         if (struct stat st{}; lstat(it->second->node_path().data(), &st) != 0) {
-            cannot_mnt = true;
+            // if it's a whiteout, we don't care if the target doesn't exist
+            cannot_mnt = !it->second->is_wht();
         } else {
             it->second->set_exist(true);
-            cannot_mnt = it->second->is_lnk() || S_ISLNK(st.st_mode);
+            cannot_mnt = it->second->is_lnk() || S_ISLNK(st.st_mode) || it->second->is_wht();
         }
 
         if (cannot_mnt) {
@@ -79,9 +72,9 @@ bool dir_node::prepare() {
             upgrade_to_tmpfs = true;
         }
         if (auto dn = dyn_cast<dir_node>(it->second)) {
-            if (skip_mirror()) {
+            if (replace()) {
                 // Propagate skip mirror state to all children
-                dn->set_skip_mirror(true);
+                dn->set_replace(true);
             }
             if (dn->prepare()) {
                 // Upgrade child to tmpfs
@@ -93,14 +86,14 @@ bool dir_node::prepare() {
     return upgrade_to_tmpfs;
 }
 
-void dir_node::collect_module_files(const char *module, int dfd) {
+void dir_node::collect_module_files(std::string_view module, int dfd) {
     auto dir = xopen_dir(xopenat(dfd, name().data(), O_RDONLY | O_CLOEXEC));
     if (!dir)
         return;
 
     for (dirent *entry; (entry = xreaddir(dir.get()));) {
         if (entry->d_name == ".replace"sv) {
-            set_skip_mirror(true);
+            set_replace(true);
             continue;
         }
 
@@ -115,6 +108,14 @@ void dir_node::collect_module_files(const char *module, int dfd) {
                 node->collect_module_files(module, dirfd(dir.get()));
             }
         } else {
+            if (entry->d_type == DT_CHR) {
+                struct stat st{};
+                int ret = fstatat(dirfd(dir.get()), entry->d_name, &st, AT_SYMLINK_NOFOLLOW);
+                if (ret == 0 && st.st_rdev == 0) {
+                    // if the file is a whiteout, mark it as such
+                    entry->d_type = DT_WHT;
+                }
+            }
             emplace<module_node>(entry->d_name, module, entry);
         }
     }
@@ -124,8 +125,8 @@ void dir_node::collect_module_files(const char *module, int dfd) {
  * Mount Implementations
  ************************/
 
-void node_entry::create_and_mount(const char *reason, const string &src) {
-    const string &dest = node_path();
+void node_entry::create_and_mount(const char *reason, const string &src, bool ro) {
+    const string dest = isa<tmpfs_node>(parent()) ? worker_path() : node_path();
     if (is_lnk()) {
         VLOGD("cp_link", src.data(), dest.data());
         cp_afc(src.data(), dest.data());
@@ -137,21 +138,24 @@ void node_entry::create_and_mount(const char *reason, const string &src) {
         else
             return;
         bind_mount(reason, src.data(), dest.data());
+        if (ro) {
+            xmount(nullptr, dest.data(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr);
+        }
     }
 }
 
-void mirror_node::mount() {
-    create_and_mount("mirror", mirror_path());
-}
-
 void module_node::mount() {
-    std::string path = module + (parent()->root()->prefix + node_path());
+    if (is_wht()) {
+        VLOGD("delete", "null", node_path().data());
+        return;
+    }
+    std::string path{module.begin(), module.end()};
+    path += parent()->root()->prefix;
+    path += node_path();
     string mnt_src = module_mnt + path;
     {
         string src = MODULEROOT "/" + path;
-        if (exist()) clone_attr(mirror_path().data(), src.data());
-        // special case for /system/etc/hosts to ensure it is writable
-        if (node_path() == "/system/etc/hosts") mnt_src = std::move(src);
+        if (exist()) clone_attr(node_path().data(), src.data());
     }
     if (isa<tmpfs_node>(parent())) {
         create_and_mount("module", mnt_src);
@@ -161,23 +165,24 @@ void module_node::mount() {
 }
 
 void tmpfs_node::mount() {
-    string src = mirror_path();
-    const string &dest = node_path();
-    const char *src_path;
-    if (access(src.data(), F_OK) == 0)
-        src_path = src.data();
-    else
-        src_path = parent()->node_path().data();
+    if (!is_dir()) {
+        create_and_mount("mirror", node_path());
+        return;
+    }
     if (!isa<tmpfs_node>(parent())) {
-        auto worker_dir = get_magisk_tmp() + "/"s WORKERDIR + dest;
+        auto worker_dir = worker_path();
         mkdirs(worker_dir.data(), 0);
-        create_and_mount(skip_mirror() ? "replace" : "tmpfs", worker_dir);
+        clone_attr(exist() ? node_path().data() : parent()->node_path().data(), worker_dir.data());
+        dir_node::mount();
+        bind_mount(replace() ? "replace" : "move", worker_dir.data(), node_path().data());
+        xmount(nullptr, node_path().data(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr);
     } else {
+        const string dest = worker_path();
         // We don't need another layer of tmpfs if parent is tmpfs
         mkdir(dest.data(), 0);
+        clone_attr(exist() ? node_path().data() : parent()->worker_path().data(), dest.data());
+        dir_node::mount();
     }
-    clone_attr(src_path, dest.data());
-    dir_node::mount();
 }
 
 /****************
@@ -187,38 +192,40 @@ void tmpfs_node::mount() {
 class magisk_node : public node_entry {
 public:
     explicit magisk_node(const char *name) : node_entry(name, DT_REG, this) {}
+    explicit magisk_node(const char *name, const char *target)
+    : node_entry(name, DT_LNK, this), target(target)  {}
 
     void mount() override {
-        const string src = get_magisk_tmp() + "/"s + name();
-        if (access(src.data(), F_OK))
-            return;
-
-        const string &dir_name = parent()->node_path();
-        if (name() == "magisk") {
-            for (int i = 0; applet_names[i]; ++i) {
-                string dest = dir_name + "/" + applet_names[i];
-                VLOGD("create", "./magisk", dest.data());
-                xsymlink("./magisk", dest.data());
-            }
+        if (target) {
+            string dest = isa<tmpfs_node>(parent()) ? worker_path() : node_path();
+            VLOGD("create", target, dest.data());
+            xsymlink(target, dest.data());
         } else {
-            string dest = dir_name + "/supolicy";
-            VLOGD("create", "./magiskpolicy", dest.data());
-            xsymlink("./magiskpolicy", dest.data());
+            string src = get_magisk_tmp() + "/"s + name();
+            if (access(src.data(), F_OK) == 0)
+                create_and_mount("magisk", src, true);
         }
-        create_and_mount("magisk", src);
-        xmount(nullptr, node_path().data(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr);
     }
+
+private:
+    const char *target = nullptr;
 };
 
 class zygisk_node : public node_entry {
 public:
-    explicit zygisk_node(const char *name, bool is64bit) : node_entry(name, DT_REG, this),
-                                                           is64bit(is64bit) {}
+    explicit zygisk_node(const char *name, bool is64bit)
+    : node_entry(name, DT_REG, this), is64bit(is64bit) {}
 
     void mount() override {
-        const string src = get_magisk_tmp() + "/magisk"s + (is64bit ? "64" : "32");
-        create_and_mount("zygisk", src);
-        xmount(nullptr, node_path().data(), nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr);
+#if defined(__LP64__)
+        const string src = get_magisk_tmp() + "/magisk"s + (is64bit ? "" : "32");
+#else
+        const string src = get_magisk_tmp() + "/magisk"s;
+        (void) is64bit;
+#endif
+        if (access(src.data(), F_OK))
+            return;
+        create_and_mount("zygisk", src, true);
     }
 
 private:
@@ -236,10 +243,10 @@ static void inject_magisk_bins(root_node *system) {
     bin->insert(new magisk_node("magisk"));
     bin->insert(new magisk_node("magiskpolicy"));
 
-    // Also delete all applets to make sure no modules can override it
+    // Also insert all applets to make sure no one can override it
     for (int i = 0; applet_names[i]; ++i)
-        delete bin->extract(applet_names[i]);
-    delete bin->extract("supolicy");
+        bin->insert(new magisk_node(applet_names[i], "./magisk"));
+    bin->insert(new magisk_node("supolicy", "./magiskpolicy"));
 }
 
 static void inject_zygisk_libs(root_node *system) {
@@ -262,10 +269,7 @@ static void inject_zygisk_libs(root_node *system) {
     }
 }
 
-vector<module_info> *module_list;
-
-void load_modules() {
-    node_entry::mirror_dir = get_magisk_tmp() + "/"s MIRRDIR;
+static void load_modules(bool zygisk_enabled, const rust::Vec<ModuleInfo> &module_list) {
     node_entry::module_mnt =  get_magisk_tmp() + "/"s MODULEMNT "/";
 
     auto root = make_unique<root_node>("");
@@ -274,14 +278,14 @@ void load_modules() {
 
     char buf[4096];
     LOGI("* Loading modules\n");
-    for (const auto &m : *module_list) {
-        const char *module = m.name.data();
-        char *b = buf + ssprintf(buf, sizeof(buf), "%s/" MODULEMNT "/%s/", get_magisk_tmp(), module);
+    for (const auto &m : module_list) {
+        char *b = buf + ssprintf(buf, sizeof(buf), "%s/" MODULEMNT "/%.*s/",
+                                 get_magisk_tmp(), (int) m.name.size(), m.name.data());
 
         // Read props
         strcpy(b, "system.prop");
         if (access(buf, F_OK) == 0) {
-            LOGI("%s: loading [system.prop]\n", module);
+            LOGI("%.*s: loading [system.prop]\n", (int) m.name.size(), m.name.data());
             // Do NOT go through property service as it could cause boot lock
             load_prop_file(buf, true);
         }
@@ -296,10 +300,10 @@ void load_modules() {
         if (access(buf, F_OK) != 0)
             continue;
 
-        LOGI("%s: loading mount files\n", module);
+        LOGI("%.*s: loading mount files\n", (int) m.name.size(), m.name.data());
         b[-1] = '\0';
         int fd = xopen(buf, O_RDONLY | O_CLOEXEC);
-        system->collect_module_files(module, fd);
+        system->collect_module_files({ m.name.begin(), m.name.end() }, fd);
         close(fd);
     }
     if (get_magisk_tmp() != "/sbin"sv || !str_contains(getenv("PATH") ?: "", "/sbin")) {
@@ -313,12 +317,12 @@ void load_modules() {
             native_bridge_orig = "0";
         }
         native_bridge = native_bridge_orig != "0" ? ZYGISKLDR + native_bridge_orig : ZYGISKLDR;
-        set_prop(NBPROP, native_bridge.data(), true);
+        set_prop(NBPROP, native_bridge.data());
         // Weather Huawei's Maple compiler is enabled.
         // If so, system server will be created by a special Zygote which ignores the native bridge
         // and make system server out of our control. Avoid it by disabling.
         if (get_prop("ro.maple.enable") == "1") {
-            set_prop("ro.maple.enable", "0", true);
+            set_prop("ro.maple.enable", "0");
         }
         inject_zygisk_libs(system);
     }
@@ -337,9 +341,6 @@ void load_modules() {
         root->prepare();
         root->mount();
     }
-
-    ssprintf(buf, sizeof(buf), "%s/" WORKERDIR, get_magisk_tmp());
-    xmount(nullptr, buf, nullptr, MS_REMOUNT | MS_RDONLY, nullptr);
 }
 
 /************************
@@ -388,8 +389,9 @@ static void foreach_module(Func fn) {
     }
 }
 
-static void collect_modules(bool open_zygisk) {
-    foreach_module([=](int dfd, dirent *entry, int modfd) {
+static rust::Vec<ModuleInfo> collect_modules(bool zygisk_enabled, bool open_zygisk) {
+    rust::Vec<ModuleInfo> modules;
+    foreach_module([&](int dfd, dirent *entry, int modfd) {
         if (faccessat(modfd, "remove", F_OK, 0) == 0) {
             LOGI("%s: remove\n", entry->d_name);
             auto uninstaller = MODULEROOT + "/"s + entry->d_name + "/uninstall.sh";
@@ -403,7 +405,7 @@ static void collect_modules(bool open_zygisk) {
         if (faccessat(modfd, "disable", F_OK, 0) == 0)
             return;
 
-        module_info info;
+        ModuleInfo info{{}, -1, -1};
         if (zygisk_enabled) {
             // Riru and its modules are not compatible with zygisk
             if (entry->d_name == "riru-core"sv || faccessat(modfd, "riru", F_OK, 0) == 0) {
@@ -413,14 +415,19 @@ static void collect_modules(bool open_zygisk) {
             if (open_zygisk) {
 #if defined(__arm__)
                 info.z32 = openat(modfd, "zygisk/armeabi-v7a.so", O_RDONLY | O_CLOEXEC);
+                info.z64 = -1;
 #elif defined(__aarch64__)
                 info.z32 = openat(modfd, "zygisk/armeabi-v7a.so", O_RDONLY | O_CLOEXEC);
                 info.z64 = openat(modfd, "zygisk/arm64-v8a.so", O_RDONLY | O_CLOEXEC);
 #elif defined(__i386__)
                 info.z32 = openat(modfd, "zygisk/x86.so", O_RDONLY | O_CLOEXEC);
+                info.z64 = -1;
 #elif defined(__x86_64__)
                 info.z32 = openat(modfd, "zygisk/x86.so", O_RDONLY | O_CLOEXEC);
                 info.z64 = openat(modfd, "zygisk/x86_64.so", O_RDONLY | O_CLOEXEC);
+#elif defined(__riscv)
+                info.z32 = -1;
+                info.z64 = openat(modfd, "zygisk/riscv64.so", O_RDONLY | O_CLOEXEC);
 #else
 #error Unsupported ABI
 #endif
@@ -434,7 +441,7 @@ static void collect_modules(bool open_zygisk) {
             }
         }
         info.name = entry->d_name;
-        module_list->push_back(info);
+        modules.push_back(std::move(info));
     });
     if (zygisk_enabled) {
         bool use_memfd = true;
@@ -454,23 +461,22 @@ static void collect_modules(bool open_zygisk) {
             }
             return fd;
         };
-        std::for_each(module_list->begin(), module_list->end(), [&](module_info &info) {
+        std::for_each(modules.begin(),modules.end(), [&](ModuleInfo &info) {
             info.z32 = convert_to_memfd(info.z32);
-#if defined(__LP64__)
             info.z64 = convert_to_memfd(info.z64);
-#endif
         });
     }
+    return modules;
 }
 
-void handle_modules() {
+rust::Vec<ModuleInfo> MagiskD::handle_modules() const noexcept {
+    bool zygisk = zygisk_enabled();
     prepare_modules();
-    collect_modules(false);
-    exec_module_scripts("post-fs-data");
-
+    exec_module_scripts("post-fs-data", collect_modules(zygisk, false));
     // Recollect modules (module scripts could remove itself)
-    module_list->clear();
-    collect_modules(true);
+    auto list = collect_modules(zygisk, true);
+    load_modules(zygisk, list);
+    return list;
 }
 
 static int check_rules_dir(char *buf, size_t sz) {
@@ -509,31 +515,4 @@ void remove_modules() {
         }
     });
     rm_rf(MODULEROOT);
-}
-
-void exec_module_scripts(const char *stage) {
-    vector<string_view> module_names;
-    std::transform(module_list->begin(), module_list->end(), std::back_inserter(module_names),
-        [](const module_info &info) -> string_view { return info.name; });
-    exec_module_scripts(stage, module_names);
-}
-
-void reset_zygisk(bool restore) {
-    if (!zygisk_enabled) return;
-    static atomic_uint zygote_start_count{1};
-    if (restore) {
-        zygote_start_count = 1;
-    } else if (zygote_start_count.fetch_add(1) > 3) {
-        LOGW("zygote crashes too many times, rolling-back\n");
-        restore = true;
-    }
-    if (restore) {
-        string native_bridge_orig = "0";
-        if (native_bridge.length() > strlen(ZYGISKLDR)) {
-            native_bridge_orig = native_bridge.substr(strlen(ZYGISKLDR));
-        }
-        set_prop(NBPROP, native_bridge_orig.data(), true);
-    } else {
-        set_prop(NBPROP, native_bridge.data(), true);
-    }
 }

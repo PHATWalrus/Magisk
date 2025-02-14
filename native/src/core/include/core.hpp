@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/socket.h>
 #include <pthread.h>
 #include <poll.h>
 #include <string>
@@ -7,38 +8,16 @@
 #include <atomic>
 #include <functional>
 
-#include "socket.hpp"
+#include <base.hpp>
+
+#include "../core-rs.hpp"
 
 #define AID_ROOT   0
 #define AID_SHELL  2000
-#define AID_APP_START 10000
-#define AID_APP_END 19999
 #define AID_USER_OFFSET 100000
 
 #define to_app_id(uid)  (uid % AID_USER_OFFSET)
 #define to_user_id(uid) (uid / AID_USER_OFFSET)
-
-namespace rust {
-struct MagiskD;
-}
-
-struct MagiskD {
-    // Make sure only references can exist
-    ~MagiskD() = delete;
-
-    // Binding to Rust
-    static const MagiskD &get();
-    void boot_stage_handler(int client, int code) const;
-
-    // C++ implementation
-    void reboot() const;
-    void post_fs_data() const;
-    void late_start() const;
-    void boot_complete() const;
-
-private:
-    const rust::MagiskD &as_rust() const;
-};
 
 // Return codes for daemon
 enum class RespondCode : int {
@@ -49,23 +28,56 @@ enum class RespondCode : int {
     END
 };
 
-struct module_info {
-    std::string name;
-    int z32 = -1;
-#if defined(__LP64__)
-    int z64 = -1;
-#endif
+struct ModuleInfo;
+
+extern std::string native_bridge;
+
+// Daemon
+int connect_daemon(int req, bool create = false);
+const char *get_magisk_tmp();
+void unlock_blocks();
+bool setup_magisk_env();
+bool check_key_combo();
+void restore_zygisk_prop();
+
+// Sockets
+struct sock_cred : public ucred {
+    std::string context;
 };
 
-extern bool zygisk_enabled;
-extern std::vector<module_info> *module_list;
+template<typename T> requires(std::is_trivially_copyable_v<T>)
+T read_any(int fd) {
+    T val;
+    if (xxread(fd, &val, sizeof(val)) != sizeof(val))
+        return -1;
+    return val;
+}
 
-void reset_zygisk(bool restore);
-extern "C" const char *get_magisk_tmp();
-int connect_daemon(int req, bool create = false);
-std::string find_preinit_device();
-void unlock_blocks();
-void reboot();
+template<typename T> requires(std::is_trivially_copyable_v<T>)
+void write_any(int fd, T val) {
+    if (fd < 0) return;
+    xwrite(fd, &val, sizeof(val));
+}
+
+bool get_client_cred(int fd, sock_cred *cred);
+static inline int read_int(int fd) { return read_any<int>(fd); }
+static inline void write_int(int fd, int val) { write_any(fd, val); }
+std::string read_string(int fd);
+bool read_string(int fd, std::string &str);
+void write_string(int fd, std::string_view str);
+
+template<typename T> requires(std::is_trivially_copyable_v<T>)
+void write_vector(int fd, const std::vector<T> &vec) {
+    write_int(fd, vec.size());
+    xwrite(fd, vec.data(), vec.size() * sizeof(T));
+}
+
+template<typename T> requires(std::is_trivially_copyable_v<T>)
+bool read_vector(int fd, std::vector<T> &vec) {
+    int size = read_int(fd);
+    vec.resize(size);
+    return xread(fd, vec.data(), size * sizeof(T)) == size * sizeof(T);
+}
 
 // Poll control
 using poll_callback = void(*)(pollfd*);
@@ -74,47 +86,42 @@ void unregister_poll(int fd, bool auto_close);
 void clear_poll();
 
 // Thread pool
+void init_thread_pool();
 void exec_task(std::function<void()> &&task);
 
 // Daemon handlers
-void boot_stage_handler(int client, int code);
 void denylist_handler(int client, const sock_cred *cred);
-void su_daemon_handler(int client, const sock_cred *cred);
-void zygisk_handler(int client, const sock_cred *cred);
-
-// Package
-extern std::atomic<ino_t> pkg_xml_ino;
-void preserve_stub_apk();
-void check_pkg_refresh();
-std::vector<bool> get_app_no_list();
-// Call check_pkg_refresh() before calling get_manager(...)
-// to make sure the package state is invalidated!
-int get_manager(int user_id = 0, std::string *pkg = nullptr, bool install = false);
-void prune_su_access();
 
 // Module stuffs
-void handle_modules();
-void load_modules();
 void disable_modules();
 void remove_modules();
-void exec_module_scripts(const char *stage);
 
 // Scripting
+void install_apk(rust::Utf8CStr apk);
+void uninstall_pkg(rust::Utf8CStr pkg);
+void exec_common_scripts(rust::Utf8CStr stage);
+void exec_module_scripts(rust::Utf8CStr stage, const rust::Vec<ModuleInfo> &module_list);
 void exec_script(const char *script);
-void exec_common_scripts(const char *stage);
-void exec_module_scripts(const char *stage, const std::vector<std::string_view> &modules);
-void install_apk(const char *apk);
-void uninstall_pkg(const char *pkg);
 void clear_pkg(const char *pkg, int user_id);
 [[noreturn]] void install_module(const char *file);
 
 // Denylist
-extern std::atomic_flag skip_pkg_rescan;
 extern std::atomic<bool> denylist_enforced;
 int denylist_cli(int argc, char **argv);
 void initialize_denylist();
+void scan_deny_apps();
 bool is_deny_target(int uid, std::string_view process);
-void revert_unmount();
+void revert_unmount(int pid = -1) noexcept;
+void update_deny_flags(int uid, rust::Str process, uint32_t &flags);
 
-// Include last to prevent recursive include issues
-#include "../core-rs.hpp"
+// MagiskSU
+void exec_root_shell(int client, int pid, SuRequest &req, MntNsMode mode);
+void app_log(const SuAppRequest &info, SuPolicy policy, bool notify);
+void app_notify(const SuAppRequest &info, SuPolicy policy);
+int app_request(const SuAppRequest &info);
+
+// Rust bindings
+static inline rust::Utf8CStr get_magisk_tmp_rs() { return get_magisk_tmp(); }
+static inline rust::String resolve_preinit_dir_rs(rust::Utf8CStr base_dir) {
+    return resolve_preinit_dir(base_dir.c_str());
+}

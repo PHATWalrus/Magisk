@@ -13,16 +13,19 @@ struct AppSpecializeArgs_v1;
 using  AppSpecializeArgs_v2 = AppSpecializeArgs_v1;
 struct AppSpecializeArgs_v3;
 using  AppSpecializeArgs_v4 = AppSpecializeArgs_v3;
+struct AppSpecializeArgs_v5;
 
 struct module_abi_v1;
 using  module_abi_v2 = module_abi_v1;
 using  module_abi_v3 = module_abi_v1;
 using  module_abi_v4 = module_abi_v1;
+using  module_abi_v5 = module_abi_v1;
 
 struct api_abi_v1;
 struct api_abi_v2;
 using  api_abi_v3 = api_abi_v2;
 struct api_abi_v4;
+using  api_abi_v5 = api_abi_v4;
 
 union ApiTable;
 
@@ -55,6 +58,17 @@ struct AppSpecializeArgs_v3 {
             instruction_set(instruction_set), app_data_dir(app_data_dir) {}
 };
 
+struct AppSpecializeArgs_v5 : public AppSpecializeArgs_v3 {
+    jboolean *mount_sysprop_overrides = nullptr;
+
+    AppSpecializeArgs_v5(
+            jint &uid, jint &gid, jintArray &gids, jint &runtime_flags,
+            jobjectArray &rlimits, jint &mount_external, jstring &se_info, jstring &nice_name,
+            jstring &instruction_set, jstring &app_data_dir) : AppSpecializeArgs_v3(
+                    uid, gid, gids, runtime_flags, rlimits, mount_external,
+                    se_info, nice_name, instruction_set, app_data_dir) {}
+};
+
 struct AppSpecializeArgs_v1 {
     jint &uid;
     jint &gid;
@@ -73,14 +87,14 @@ struct AppSpecializeArgs_v1 {
     jboolean *const mount_data_dirs;
     jboolean *const mount_storage_dirs;
 
-    AppSpecializeArgs_v1(const AppSpecializeArgs_v3 *v3) :
-            uid(v3->uid), gid(v3->gid), gids(v3->gids), runtime_flags(v3->runtime_flags),
-            mount_external(v3->mount_external), se_info(v3->se_info), nice_name(v3->nice_name),
-            instruction_set(v3->instruction_set), app_data_dir(v3->app_data_dir),
-            is_child_zygote(v3->is_child_zygote), is_top_app(v3->is_top_app),
-            pkg_data_info_list(v3->pkg_data_info_list),
-            whitelisted_data_info_list(v3->whitelisted_data_info_list),
-            mount_data_dirs(v3->mount_data_dirs), mount_storage_dirs(v3->mount_storage_dirs) {}
+    AppSpecializeArgs_v1(const AppSpecializeArgs_v5 *a) :
+            uid(a->uid), gid(a->gid), gids(a->gids), runtime_flags(a->runtime_flags),
+            mount_external(a->mount_external), se_info(a->se_info), nice_name(a->nice_name),
+            instruction_set(a->instruction_set), app_data_dir(a->app_data_dir),
+            is_child_zygote(a->is_child_zygote), is_top_app(a->is_top_app),
+            pkg_data_info_list(a->pkg_data_info_list),
+            whitelisted_data_info_list(a->whitelisted_data_info_list),
+            mount_data_dirs(a->mount_data_dirs), mount_storage_dirs(a->mount_storage_dirs) {}
 };
 
 struct ServerSpecializeArgs_v1 {
@@ -108,16 +122,13 @@ struct module_abi_v1 {
     void (*postServerSpecialize)(void *, const void *);
 };
 
+// Assert the flag values to be the same as the public API
+static_assert(+ZygiskStateFlags::ProcessGrantedRoot == zygisk::StateFlag::PROCESS_GRANTED_ROOT);
+static_assert(+ZygiskStateFlags::ProcessOnDenyList == zygisk::StateFlag::PROCESS_ON_DENYLIST);
+
 enum : uint32_t {
-    PROCESS_GRANTED_ROOT = zygisk::StateFlag::PROCESS_GRANTED_ROOT,
-    PROCESS_ON_DENYLIST = zygisk::StateFlag::PROCESS_ON_DENYLIST,
-
-    PROCESS_IS_SYS_UI = (1u << 29),
-    DENYLIST_ENFORCING = (1u << 30),
-    PROCESS_IS_MAGISK_APP = (1u << 31),
-
-    UNMOUNT_MASK = (PROCESS_ON_DENYLIST | DENYLIST_ENFORCING),
-    PRIVATE_MASK = (PROCESS_IS_SYS_UI | DENYLIST_ENFORCING | PROCESS_IS_MAGISK_APP)
+    UNMOUNT_MASK = (+ZygiskStateFlags::ProcessOnDenyList | +ZygiskStateFlags::DenyListEnforced),
+    PRIVATE_MASK = (+ZygiskStateFlags::DenyListEnforced | +ZygiskStateFlags::ProcessIsMagiskApp)
 };
 
 struct api_abi_base {
@@ -163,8 +174,8 @@ struct ZygiskModule {
         entry.fn(&api, env);
     }
 
-    void preAppSpecialize(AppSpecializeArgs_v3 *args) const;
-    void postAppSpecialize(const AppSpecializeArgs_v3 *args) const;
+    void preAppSpecialize(AppSpecializeArgs_v5 *args) const;
+    void postAppSpecialize(const AppSpecializeArgs_v5 *args) const;
     void preServerSpecialize(ServerSpecializeArgs_v1 *args) const;
     void postServerSpecialize(const ServerSpecializeArgs_v1 *args) const;
 
@@ -175,7 +186,6 @@ struct ZygiskModule {
     static uint32_t getFlags();
     void tryUnload() const;
     void clearApi() { memset(&api, 0, sizeof(api)); }
-    int getId() const { return id; }
 
     ZygiskModule(int id, void *handle, void *entry);
 
@@ -211,8 +221,6 @@ enum : uint32_t {
     SKIP_CLOSE_LOG_PIPE = (1u << 5),
 };
 
-#define MAX_FD_SIZE 1024
-
 #define DCL_PRE_POST(name) \
 void name##_pre();         \
 void name##_post();
@@ -221,7 +229,7 @@ struct ZygiskContext {
     JNIEnv *env;
     union {
         void *ptr;
-        AppSpecializeArgs_v3 *app;
+        AppSpecializeArgs_v5 *app;
         ServerSpecializeArgs_v1 *server;
     } args;
 
@@ -231,7 +239,7 @@ struct ZygiskContext {
     int pid;
     uint32_t flags;
     uint32_t info_flags;
-    std::bitset<MAX_FD_SIZE> allowed_fds;
+    std::vector<bool> allowed_fds;
     std::vector<int> exempted_fds;
 
     struct RegisterInfo {
@@ -253,7 +261,7 @@ struct ZygiskContext {
     ZygiskContext(JNIEnv *env, void *args);
     ~ZygiskContext();
 
-    void run_modules_pre(const std::vector<int> &fds);
+    void run_modules_pre(rust::Vec<int> &fds);
     void run_modules_post();
     DCL_PRE_POST(fork)
     DCL_PRE_POST(app_specialize)
@@ -262,6 +270,7 @@ struct ZygiskContext {
     DCL_PRE_POST(nativeSpecializeAppProcess)
     DCL_PRE_POST(nativeForkSystemServer)
 
+    int get_module_info(int uid, rust::Vec<int> &fds);
     void sanitize_fds();
     bool exempt_fd(int fd);
     bool can_exempt_fd() const;

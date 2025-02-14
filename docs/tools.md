@@ -41,7 +41,9 @@ Supported actions:
 
   repack [-n] <origbootimg> [outbootimg]
     Repack boot image components using files from the current directory
-    to [outbootimg], or 'new-boot.img' if not specified.
+    to [outbootimg], or 'new-boot.img' if not specified. Current directory
+    should only contain required files for [outbootimg], or incorrect
+    [outbootimg] may be produced.
     <origbootimg> is the original boot image used to unpack the components.
     By default, each component will be automatically compressed using its
     corresponding format detected in <origbootimg>. If a component file
@@ -97,7 +99,7 @@ Supported actions:
       test
         Test the cpio's status
         Return value is 0 or bitwise or-ed of following values:
-        0x1:Magisk    0x2:unsupported    0x4:Sony
+        0x1:Magisk    0x2:unsupported
       patch
         Apply ramdisk patches
         Configure with env variables: KEEPVERITY KEEPFORCEENCRYPT

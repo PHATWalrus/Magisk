@@ -6,12 +6,66 @@
 #include <consts.hpp>
 #include <base.hpp>
 #include <flags.h>
+#include <xz.h>
 
 #include "init.hpp"
 
 using namespace std;
 
 static vector<string> rc_list;
+static string magic_mount_list;
+
+#define NEW_INITRC_DIR  "/system/etc/init/hw"
+#define INIT_RC         "init.rc"
+
+static bool unxz(out_stream &strm, rust::Slice<const uint8_t> bytes) {
+    uint8_t out[8192];
+    xz_crc32_init();
+    size_t size = bytes.size();
+    struct xz_dec *dec = xz_dec_init(XZ_DYNALLOC, 1 << 26);
+    run_finally finally([&] { xz_dec_end(dec); });
+    struct xz_buf b = {
+        .in = bytes.data(),
+        .in_pos = 0,
+        .in_size = size,
+        .out = out,
+        .out_pos = 0,
+        .out_size = sizeof(out)
+    };
+    enum xz_ret ret;
+    do {
+        ret = xz_dec_run(dec, &b);
+        if (ret != XZ_OK && ret != XZ_STREAM_END)
+            return false;
+        strm.write(out, b.out_pos);
+        b.out_pos = 0;
+    } while (b.in_pos != size);
+    return true;
+}
+
+static void magic_mount(const string &sdir, const string &ddir = "") {
+    auto dir = xopen_dir(sdir.data());
+    if (!dir) return;
+    for (dirent *entry; (entry = xreaddir(dir.get()));) {
+        string src = sdir + "/" + entry->d_name;
+        string dest = ddir + "/" + entry->d_name;
+        if (access(dest.data(), F_OK) == 0) {
+            if (entry->d_type == DT_DIR) {
+                // Recursive
+                magic_mount(src, dest);
+            } else {
+                LOGD("Mount [%s] -> [%s]\n", src.data(), dest.data());
+                struct stat st;
+                xstat(dest.data(), &st);
+                chmod(src.data(), st.st_mode & 0777);
+                chown(src.data(), st.st_uid, st.st_gid);
+                xmount(src.data(), dest.data(), nullptr, MS_BIND, nullptr);
+                magic_mount_list += dest;
+                magic_mount_list += '\n';
+            }
+        }
+    }
+}
 
 static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
@@ -32,13 +86,13 @@ static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
     // First patch init.rc
     {
-        auto src = xopen_file(xopenat(src_fd, "init.rc", O_RDONLY | O_CLOEXEC, 0), "re");
+        auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
         if (!src) return;
-        if (writable) unlinkat(src_fd, "init.rc", 0);
+        if (writable) unlinkat(src_fd, INIT_RC, 0);
         auto dest = xopen_file(
-                xopenat(dest_fd, "init.rc", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
+                xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return;
-        LOGD("Patching init.rc in %s\n", src_path);
+        LOGD("Patching " INIT_RC " in %s\n", src_path);
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
             // Do not start vaultkeeper
             if (str_contains(line, "start vaultkeeper")) {
@@ -73,24 +127,7 @@ static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         rc_list.clear();
 
         // Inject Magisk rc scripts
-        LOGD("Inject magisk rc\n");
-        fprintf(dest.get(), R"EOF(
-on post-fs-data
-    start logd
-    exec %2$s 0 0 -- %1$s/magisk --post-fs-data
-
-on property:vold.decrypt=trigger_restart_framework
-    exec %2$s 0 0 -- %1$s/magisk --service
-
-on nonencrypted
-    exec %2$s 0 0 -- %1$s/magisk --service
-
-on property:sys.boot_completed=1
-    exec %2$s 0 0 -- %1$s/magisk --boot-complete
-
-on property:init.svc.zygote=stopped
-    exec %2$s 0 0 -- %1$s/magisk --zygote-restart
-)EOF", tmp_path, MAGISK_PROC_CON);
+        rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
 
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
@@ -110,14 +147,51 @@ on property:init.svc.zygote=stopped
             if (line.starts_with("service zygote ")) {
                 LOGD("Inject zygote restart\n");
                 fprintf(dest.get(), "%s", line.data());
-                fprintf(dest.get(), "    onrestart exec %2$s 0 0 -- %1$s/magisk --zygote-restart\n",
-                        tmp_path, MAGISK_PROC_CON);
+                fprintf(dest.get(),
+                        "    onrestart exec " MAGISK_PROC_CON " 0 0 -- %s/magisk --zygote-restart\n", tmp_path);
                 return true;
             }
             fprintf(dest.get(), "%s", line.data());
             return true;
         });
         fclone_attr(fileno(src.get()), fileno(dest.get()));
+    }
+
+    if (faccessat(src_fd, "init.fission_host.rc", F_OK, 0) == 0) {
+        {
+            LOGD("Patching fissiond\n");
+            mmap_data fissiond("/system/bin/fissiond", false);
+            for (size_t off : fissiond.patch("ro.build.system.fission_single_os", "ro.build.system.xxxxxxxxxxxxxxxxx")) {
+                LOGD("Patch @ %08zX [ro.build.system.fission_single_os] -> [ro.build.system.xxxxxxxxxxxxxxxxx]\n", off);
+            }
+            mkdirs(ROOTOVL "/system/bin", 0755);
+            if (auto target_fissiond = xopen_file(ROOTOVL "/system/bin/fissiond", "we")) {
+                fwrite(fissiond.buf(), 1, fissiond.sz(), target_fissiond.get());
+                clone_attr("/system/bin/fissiond", ROOTOVL "/system/bin/fissiond");
+            }
+        }
+        LOGD("hijack isolated\n");
+        auto hijack = xopen_file("/sys/devices/system/cpu/isolated", "re");
+        mkfifo(INTLROOT "/isolated", 0777);
+        xmount(INTLROOT "/isolated", "/sys/devices/system/cpu/isolated", nullptr, MS_BIND, nullptr);
+        if (!xfork()) {
+            auto dest = xopen_file(INTLROOT "/isolated", "we");
+            LOGD("hijacked isolated\n");
+            xumount2("/sys/devices/system/cpu/isolated", MNT_DETACH);
+            unlink(INTLROOT "/isolated");
+            string content;
+            full_read(fileno(hijack.get()), content);
+            {
+                string target = "/dev/cells/cell2"s + tmp_path;
+                xmkdirs(target.data(), 0);
+                xmount(tmp_path, target.data(), nullptr, MS_BIND | MS_REC,nullptr);
+                magic_mount(ROOTOVL, "/dev/cells/cell2");
+                auto mount = xopen_file(ROOTMNT, "w");
+                fwrite(magic_mount_list.data(), 1, magic_mount_list.length(), mount.get());
+            }
+            fprintf(dest.get(), "%s", content.data());
+            exit(0);
+        }
     }
 }
 
@@ -127,7 +201,7 @@ static void load_overlay_rc(const char *overlay) {
 
     int dfd = dirfd(dir.get());
     // Do not allow overwrite init.rc
-    unlinkat(dfd, "init.rc", 0);
+    unlinkat(dfd, INIT_RC, 0);
 
     // '/' + name + '\0'
     char buf[NAME_MAX + 2];
@@ -178,76 +252,48 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
     }
 }
 
-static string magic_mount_list;
-
-static void magic_mount(const string &sdir, const string &ddir = "") {
-    auto dir = xopen_dir(sdir.data());
-    if (!dir) return;
-    for (dirent *entry; (entry = xreaddir(dir.get()));) {
-        string src = sdir + "/" + entry->d_name;
-        string dest = ddir + "/" + entry->d_name;
-        if (access(dest.data(), F_OK) == 0) {
-            if (entry->d_type == DT_DIR) {
-                // Recursive
-                magic_mount(src, dest);
-            } else {
-                LOGD("Mount [%s] -> [%s]\n", src.data(), dest.data());
-                xmount(src.data(), dest.data(), nullptr, MS_BIND, nullptr);
-                magic_mount_list += dest;
-                magic_mount_list += '\n';
-            }
-        }
-    }
-}
-
 static void extract_files(bool sbin) {
-    const char *m32 = sbin ? "/sbin/magisk32.xz" : "magisk32.xz";
-    const char *m64 = sbin ? "/sbin/magisk64.xz" : "magisk64.xz";
+    const char *magisk_xz = sbin ? "/sbin/magisk.xz" : "magisk.xz";
     const char *stub_xz = sbin ? "/sbin/stub.xz" : "stub.xz";
+    const char *init_ld_xz = sbin ? "/sbin/init-ld.xz" : "init-ld.xz";
 
-    if (access(m32, F_OK) == 0) {
-        mmap_data magisk(m32);
-        unlink(m32);
-        int fd = xopen("magisk32", O_WRONLY | O_CREAT, 0755);
-        fd_channel ch(fd);
+    if (access(magisk_xz, F_OK) == 0) {
+        mmap_data magisk(magisk_xz);
+        unlink(magisk_xz);
+        int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
+        fd_stream ch(fd);
         unxz(ch, magisk);
         close(fd);
-    }
-    if (access(m64, F_OK) == 0) {
-        mmap_data magisk(m64);
-        unlink(m64);
-        int fd = xopen("magisk64", O_WRONLY | O_CREAT, 0755);
-        fd_channel ch(fd);
-        unxz(ch, magisk);
-        close(fd);
-        xsymlink("./magisk64", "magisk");
-    } else {
-        xsymlink("./magisk32", "magisk");
     }
     if (access(stub_xz, F_OK) == 0) {
         mmap_data stub(stub_xz);
         unlink(stub_xz);
         int fd = xopen("stub.apk", O_WRONLY | O_CREAT, 0);
-        fd_channel ch(fd);
+        fd_stream ch(fd);
         unxz(ch, stub);
+        close(fd);
+    }
+    if (access(init_ld_xz, F_OK) == 0) {
+        mmap_data init_ld(init_ld_xz);
+        unlink(init_ld_xz);
+        int fd = xopen("init-ld", O_WRONLY | O_CREAT, 0);
+        fd_stream ch(fd);
+        unxz(ch, init_ld);
         close(fd);
     }
 }
 
-void MagiskInit::parse_config_file() {
+void MagiskInit::parse_config_file() noexcept {
     parse_prop_file("/data/.backup/.magisk", [&](auto key, auto value) -> bool {
         if (key == "PREINITDEVICE") {
-            preinit_dev = value;
+            preinit_dev = std::string(value);
             return false;
         }
         return true;
     });
 }
 
-#define ROOTMIR         MIRRDIR "/system_root"
-#define NEW_INITRC_DIR  "/system/etc/init/hw"
-
-void MagiskInit::patch_ro_root() {
+void MagiskInit::patch_ro_root() noexcept {
     mount_list.emplace_back("/data");
     parse_config_file();
 
@@ -266,10 +312,10 @@ void MagiskInit::patch_ro_root() {
 
     if (tmp_dir == "/sbin") {
         // Recreate original sbin structure
-        xmkdir(ROOTMIR, 0755);
-        xmount("/", ROOTMIR, nullptr, MS_BIND, nullptr);
-        recreate_sbin(ROOTMIR "/sbin", true);
-        xumount2(ROOTMIR, MNT_DETACH);
+        xmkdir(MIRRDIR, 0755);
+        xmount("/", MIRRDIR, nullptr, MS_BIND, nullptr);
+        recreate_sbin(MIRRDIR "/sbin", true);
+        xumount2(MIRRDIR, MNT_DETACH);
     } else {
         // Restore debug_ramdisk
         xmount("/data/debug_ramdisk", "/debug_ramdisk", nullptr, MS_MOVE, nullptr);
@@ -301,23 +347,28 @@ void MagiskInit::patch_ro_root() {
     }
 
     // Patch init.rc
-    if (access(NEW_INITRC_DIR, F_OK) == 0) {
+    if (access(NEW_INITRC_DIR "/" INIT_RC, F_OK) == 0) {
         // Android 11's new init.rc
         patch_rc_scripts(NEW_INITRC_DIR, tmp_dir.data(), false);
     } else {
         patch_rc_scripts("/", tmp_dir.data(), false);
     }
 
-    // Extract magisk
+    // Extract overlay archives
     extract_files(false);
+
+    rust::collect_overlay_contexts(ROOTOVL);
 
     // Oculus Go will use a special sepolicy if unlocked
     if (access("/sepolicy.unlocked", F_OK) == 0) {
         patch_sepolicy("/sepolicy.unlocked", ROOTOVL "/sepolicy.unlocked");
-    } else if ((access(SPLIT_PLAT_CIL, F_OK) != 0 && access("/sepolicy", F_OK) == 0) ||
-               !hijack_sepolicy()) {
-        patch_sepolicy("/sepolicy", ROOTOVL "/sepolicy");
+    } else {
+        bool patch = access(SPLIT_PLAT_CIL, F_OK) != 0 && access("/sepolicy", F_OK) == 0;
+        if (patch || !hijack_sepolicy()) {
+            patch_sepolicy("/sepolicy", ROOTOVL "/sepolicy");
+        }
     }
+    unlink("init-ld");
 
     // Mount rootdir
     magic_mount(ROOTOVL);
@@ -328,16 +379,10 @@ void MagiskInit::patch_ro_root() {
     chdir("/");
 }
 
-void RootFSInit::prepare() {
-    prepare_data();
-    LOGD("Restoring /init\n");
-    rename(backup_init(), "/init");
-}
-
 #define PRE_TMPSRC "/magisk"
 #define PRE_TMPDIR PRE_TMPSRC "/tmp"
 
-void MagiskInit::patch_rw_root() {
+void MagiskInit::patch_rw_root() noexcept {
     mount_list.emplace_back("/data");
     parse_config_file();
 
@@ -367,12 +412,14 @@ void MagiskInit::patch_rw_root() {
     setup_tmp(PRE_TMPDIR);
     chdir(PRE_TMPDIR);
 
-    // Extract magisk
+    // Extract overlay archives
     extract_files(true);
 
-    if ((!treble && access("/sepolicy", F_OK) == 0) || !hijack_sepolicy()) {
+    bool patch = !treble && access("/sepolicy", F_OK) == 0;
+    if (patch || !hijack_sepolicy()) {
         patch_sepolicy("/sepolicy", "/sepolicy");
     }
+    unlink("init-ld");
 
     chdir("/");
 
@@ -402,6 +449,22 @@ int magisk_proxy_main(int argc, char *argv[]) {
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
-    execv("/sbin/magisk", argv);
+    execve("/sbin/magisk", argv, environ);
     return 1;
+}
+
+static void unxz_init(const char *init_xz, const char *init) {
+    LOGD("unxz %s -> %s\n", init_xz, init);
+    int fd = xopen(init, O_WRONLY | O_CREAT, 0777);
+    fd_stream ch(fd);
+    unxz(ch, mmap_data{init_xz});
+    close(fd);
+    clone_attr(init_xz, init);
+    unlink(init_xz);
+}
+
+const char *MagiskInit::backup_init() const noexcept {
+    if (access("/.backup/init.xz", F_OK) == 0)
+        unxz_init("/.backup/init.xz", "/.backup/init");
+    return "/.backup/init";
 }

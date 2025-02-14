@@ -8,14 +8,12 @@
 
 #include <consts.hpp>
 #include <base.hpp>
-#include <db.hpp>
+#include <sqlite.hpp>
 #include <core.hpp>
 
 #include "deny.hpp"
 
 using namespace std;
-
-atomic_flag skip_pkg_rescan;
 
 // For the following data structures:
 // If package name == ISOLATED_MAGIC, or app ID == -1, it means isolated service
@@ -33,61 +31,48 @@ static pthread_mutex_t data_lock = PTHREAD_MUTEX_INITIALIZER;
 
 atomic<bool> denylist_enforced = false;
 
-#define do_kill (zygisk_enabled && denylist_enforced)
+static int get_app_id(const vector<int> &users, const string &pkg) {
+    struct stat st{};
+    char buf[PATH_MAX];
+    for (const auto &user_id: users) {
+        ssprintf(buf, sizeof(buf), "%s/%d/%s", APP_DATA_DIR, user_id, pkg.data());
+        if (stat(buf, &st) == 0) {
+            return to_app_id(st.st_uid);
+        }
+    }
+    return 0;
+}
 
-static void rescan_apps() {
-    LOGD("denylist: rescanning apps\n");
-
-    app_id_to_pkgs.clear();
-
+static void collect_users(vector<int> &users) {
     auto data_dir = xopen_dir(APP_DATA_DIR);
     if (!data_dir)
         return;
     dirent *entry;
     while ((entry = xreaddir(data_dir.get()))) {
-        // For each user
-        int dfd = xopenat(dirfd(data_dir.get()), entry->d_name, O_RDONLY);
-        if (auto dir = xopen_dir(dfd)) {
-            while ((entry = xreaddir(dir.get()))) {
-                struct stat st{};
-                // For each package
-                if (xfstatat(dfd, entry->d_name, &st, 0))
-                    continue;
-                int app_id = to_app_id(st.st_uid);
-                if (auto it = pkg_to_procs.find(entry->d_name); it != pkg_to_procs.end()) {
-                    app_id_to_pkgs[app_id].insert(it->first);
-                }
-            }
-        } else {
-            close(dfd);
-        }
+        users.emplace_back(parse_int(entry->d_name));
     }
 }
 
-static void update_pkg_uid(const string &pkg, bool remove) {
-    auto data_dir = xopen_dir(APP_DATA_DIR);
-    if (!data_dir)
+static int get_app_id(const string &pkg) {
+    if (pkg == ISOLATED_MAGIC)
+        return -1;
+    vector<int> users;
+    collect_users(users);
+    return get_app_id(users, pkg);
+}
+
+static void update_app_id(int app_id, const string &pkg, bool remove) {
+    if (app_id <= 0)
         return;
-    dirent *entry;
-    struct stat st{};
-    char buf[PATH_MAX] = {0};
-    // For each user
-    while ((entry = xreaddir(data_dir.get()))) {
-        ssprintf(buf, sizeof(buf), "%s/%s", entry->d_name, pkg.data());
-        if (fstatat(dirfd(data_dir.get()), buf, &st, 0) == 0) {
-            int app_id = to_app_id(st.st_uid);
-            if (remove) {
-                if (auto it = app_id_to_pkgs.find(app_id); it != app_id_to_pkgs.end()) {
-                    it->second.erase(pkg);
-                    if (it->second.empty()) {
-                        app_id_to_pkgs.erase(it);
-                    }
-                }
-            } else {
-                app_id_to_pkgs[app_id].insert(pkg);
+    if (remove) {
+        if (auto it = app_id_to_pkgs.find(app_id); it != app_id_to_pkgs.end()) {
+            it->second.erase(pkg);
+            if (it->second.empty()) {
+                app_id_to_pkgs.erase(it);
             }
-            break;
         }
+    } else {
+        app_id_to_pkgs[app_id].emplace(pkg);
     }
 }
 
@@ -121,7 +106,7 @@ static bool proc_name_match(int pid, string_view name) {
     return false;
 }
 
-static bool proc_context_match(int pid, string_view context) {
+bool proc_context_match(int pid, string_view context) {
     char buf[PATH_MAX];
     sprintf(buf, "/proc/%d/attr/current", pid);
     if (auto fp = open_file(buf, "re")) {
@@ -186,7 +171,7 @@ static bool add_hide_set(const char *pkg, const char *proc) {
     if (!p.second)
         return false;
     LOGI("denylist add: [%s/%s]\n", pkg, proc);
-    if (!do_kill)
+    if (!denylist_enforced)
         return true;
     if (str_eql(pkg, ISOLATED_MAGIC)) {
         // Kill all matching isolated processes
@@ -195,6 +180,34 @@ static bool add_hide_set(const char *pkg, const char *proc) {
         kill_process(proc);
     }
     return true;
+}
+
+void scan_deny_apps() {
+    if (!app_id_to_pkgs_)
+        return;
+
+    app_id_to_pkgs.clear();
+
+    char sql[4096];
+    vector<int> users;
+    collect_users(users);
+    for (auto it = pkg_to_procs.begin(); it != pkg_to_procs.end();) {
+        if (it->first == ISOLATED_MAGIC) {
+            it++;
+            continue;
+        }
+        int app_id = get_app_id(users, it->first);
+        if (app_id == 0) {
+            LOGI("denylist rm: [%s]\n", it->first.data());
+            ssprintf(sql, sizeof(sql), "DELETE FROM denylist WHERE package_name='%s'",
+                     it->first.data());
+            db_exec(sql);
+            it = pkg_to_procs.erase(it);
+        } else {
+            update_app_id(app_id, it->first, false);
+            it++;
+        }
+    }
 }
 
 static void clear_data() {
@@ -209,14 +222,24 @@ static bool ensure_data() {
     LOGI("denylist: initializing internal data structures\n");
 
     default_new(pkg_to_procs_);
-    char *err = db_exec("SELECT * FROM denylist", [](db_row &row) -> bool {
-        add_hide_set(row["package_name"].data(), row["process"].data());
-        return true;
+    bool res = db_exec("SELECT * FROM denylist", {}, [](StringSlice columns, const DbValues &values) {
+        const char *package_name;
+        const char *process;
+        for (int i = 0; i < columns.size(); ++i) {
+            const auto &name = columns[i];
+            if (name == "package_name") {
+                package_name = values.get_text(i);
+            } else if (name == "process") {
+                process = values.get_text(i);
+            }
+        }
+        add_hide_set(package_name, process);
     });
-    db_err_cmd(err, goto error)
+    if (!res)
+        goto error;
 
     default_new(app_id_to_pkgs_);
-    rescan_apps();
+    scan_deny_apps();
 
     return true;
 
@@ -236,19 +259,20 @@ static int add_list(const char *pkg, const char *proc) {
         mutex_guard lock(data_lock);
         if (!ensure_data())
             return DenyResponse::ERROR;
+        int app_id = get_app_id(pkg);
+        if (app_id == 0)
+            return DenyResponse::INVALID_PKG;
         if (!add_hide_set(pkg, proc))
             return DenyResponse::ITEM_EXIST;
         auto it = pkg_to_procs.find(pkg);
-        update_pkg_uid(it->first, false);
+        update_app_id(app_id, it->first, false);
     }
 
     // Add to database
     char sql[4096];
     ssprintf(sql, sizeof(sql),
             "INSERT INTO denylist (package_name, process) VALUES('%s', '%s')", pkg, proc);
-    char *err = db_exec(sql);
-    db_err_cmd(err, return DenyResponse::ERROR)
-    return DenyResponse::OK;
+    return db_exec(sql) ? DenyResponse::OK : DenyResponse::ERROR;
 }
 
 int add_list(int client) {
@@ -268,7 +292,7 @@ static int rm_list(const char *pkg, const char *proc) {
         auto it = pkg_to_procs.find(pkg);
         if (it != pkg_to_procs.end()) {
             if (proc[0] == '\0') {
-                update_pkg_uid(it->first, true);
+                update_app_id(get_app_id(pkg), it->first, true);
                 pkg_to_procs.erase(it);
                 remove = true;
                 LOGI("denylist rm: [%s]\n", pkg);
@@ -276,7 +300,7 @@ static int rm_list(const char *pkg, const char *proc) {
                 remove = true;
                 LOGI("denylist rm: [%s/%s]\n", pkg, proc);
                 if (it->second.empty()) {
-                    update_pkg_uid(it->first, true);
+                    update_app_id(get_app_id(pkg), it->first, true);
                     pkg_to_procs.erase(it);
                 }
             }
@@ -292,9 +316,7 @@ static int rm_list(const char *pkg, const char *proc) {
     else
         ssprintf(sql, sizeof(sql),
                 "DELETE FROM denylist WHERE package_name='%s' AND process='%s'", pkg, proc);
-    char *err = db_exec(sql);
-    db_err_cmd(err, return DenyResponse::ERROR)
-    return DenyResponse::OK;
+    return db_exec(sql) ? DenyResponse::OK : DenyResponse::ERROR;
 }
 
 int rm_list(int client) {
@@ -311,6 +333,7 @@ void ls_list(int client) {
             return;
         }
 
+        scan_deny_apps();
         write_int(client,static_cast<int>(DenyResponse::OK));
 
         for (const auto &[pkg, procs] : pkg_to_procs) {
@@ -324,14 +347,6 @@ void ls_list(int client) {
     }
     write_int(client, 0);
     close(client);
-}
-
-static void update_deny_config() {
-    char sql[64];
-    sprintf(sql, "REPLACE INTO settings (key,value) VALUES('%s',%d)",
-        DB_SETTING_KEYS[DENYLIST_CONFIG], denylist_enforced.load());
-    char *err = db_exec(sql);
-    db_err(err);
 }
 
 int enable_deny() {
@@ -350,39 +365,41 @@ int enable_deny() {
 
         LOGI("* Enable DenyList\n");
 
+        if (!ensure_data())
+            return DenyResponse::ERROR;
+
         denylist_enforced = true;
 
-        if (!ensure_data()) {
-            denylist_enforced = false;
-            return DenyResponse::ERROR;
+        if (!MagiskD::Get().zygisk_enabled()) {
+            if (new_daemon_thread(&logcat)) {
+                denylist_enforced = false;
+                return DenyResponse::ERROR;
+            }
         }
 
         // On Android Q+, also kill blastula pool and all app zygotes
-        if (SDK_INT >= 29 && zygisk_enabled) {
+        if (SDK_INT >= 29) {
             kill_process("usap32", true);
             kill_process("usap64", true);
             kill_process<&proc_context_match>("u:r:app_zygote:s0", true);
         }
     }
 
-    update_deny_config();
+    MagiskD::Get().set_db_setting(DbEntryKey::DenylistConfig, true);
     return DenyResponse::OK;
 }
 
 int disable_deny() {
-    if (denylist_enforced) {
-        denylist_enforced = false;
+    if (denylist_enforced.exchange(false)) {
         LOGI("* Disable DenyList\n");
     }
-    update_deny_config();
+    MagiskD::Get().set_db_setting(DbEntryKey::DenylistConfig, false);
     return DenyResponse::OK;
 }
 
 void initialize_denylist() {
     if (!denylist_enforced) {
-        db_settings dbs;
-        get_db_settings(dbs, DENYLIST_CONFIG);
-        if (dbs[DENYLIST_CONFIG])
+        if (MagiskD::Get().get_db_setting(DbEntryKey::DenylistConfig))
             enable_deny();
     }
 }
@@ -391,9 +408,6 @@ bool is_deny_target(int uid, string_view process) {
     mutex_guard lock(data_lock);
     if (!ensure_data())
         return false;
-
-    if (!skip_pkg_rescan.test_and_set())
-        rescan_apps();
 
     int app_id = to_app_id(uid);
     if (app_id >= 90000) {
@@ -414,4 +428,13 @@ bool is_deny_target(int uid, string_view process) {
         }
     }
     return false;
+}
+
+void update_deny_flags(int uid, rust::Str process, uint32_t &flags) {
+    if (is_deny_target(uid, { process.begin(), process.end() })) {
+        flags |= +ZygiskStateFlags::ProcessOnDenyList;
+    }
+    if (denylist_enforced) {
+        flags |= +ZygiskStateFlags::DenyListEnforced;
+    }
 }
